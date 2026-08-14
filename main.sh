@@ -230,15 +230,18 @@ parse_open_ports() {
         # Extract host IP from "Host: 1.2.3.4 ()" — skip line if not found
         # -z = zero-length = empty → skip lines where grep found nothing
         local host
-        host="$(echo "$line" | grep -oP 'Host:\s+\K[\d\.]+(?=\s)')"
+        # || true: grep exits 1 when there is no match; under set -e that would
+        # kill the entire script.  || true converts a non-match into an empty
+        # string, which the [[ -z ]] guard below then skips cleanly.
+        host="$(echo "$line" | grep -oP 'Host:\s+\K[\d\.]+(?=\s)' || true)"
         [[ -z "$host" ]] && continue
 
         # Capture everything after "Ports: " to end of line
         local ports_section
-        ports_section="$(echo "$line" | grep -oP 'Ports:\s+\K.+')"
+        ports_section="$(echo "$line" | grep -oP 'Ports:\s+\K.+' || true)"
         [[ -z "$ports_section" ]] && continue
 
-        # ── Defensive FIX ──────────────────────────────────────────────────────────
+        # ── BUG FIX ──────────────────────────────────────────────────────────
         # Real nmap gnmap output appends "  Ignored State: filtered (N)" after
         # the last port token on the same line, e.g.:
         #   ...Samba smbd 4/        Ignored State: filtered (65529)
