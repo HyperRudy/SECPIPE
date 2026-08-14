@@ -1,4 +1,4 @@
-#!/usr/bin/bash 
+#!/usr/bin/env bash
 # =============================================================================
 # nmap_scanner.sh — Step 1 of the Security Automation Pipeline
 # Purpose : Run a structured nmap scan, save raw output, and parse results
@@ -193,9 +193,19 @@ run_nmap_scan() {
 # ─────────────────────────────────────────────────────────────────────────────
 # PARSE OPEN PORTS FROM GNMAP (greppable format — most reliable for parsing)
 # ─────────────────────────────────────────────────────────────────────────────
-# Gnmap open-port lines look like:
-#   Host: 192.168.1.1 ()  Ports: 22/open/tcp//ssh//OpenSSH 8.2/, 80/open/tcp//http//nginx 1.18/
-# Field layout per port token: port/state/proto//service//version/
+# Gnmap "Host:" lines look like:
+#   Host: 192.168.1.1 ()  Ports: 22/open/tcp//ssh//OpenSSH 8.2/, 80/open/tcp//http//nginx/  Ignored State: filtered (65000)
+#
+# Field layout per port token (slash-separated):
+#   fields[0]=port  fields[1]=state  fields[2]=proto  fields[3]=owner(empty)
+#   fields[4]=service  fields[5]=rpc(empty)  fields[6]=version
+#
+# HOW THE FILE IS READ:
+#   At the bottom of this function, `grep "^Host:" "$gnmap_file"` opens the
+#   file and prints every line that starts with "Host:".  That output is fed
+#   via process substitution `< <(...)` into the `while` loop above it, which
+#   processes one line at a time.  Everything else in the function is just
+#   per-line string manipulation — no additional file I/O.
 # ─────────────────────────────────────────────────────────────────────────────
 parse_open_ports() {
     local gnmap_file="${OUTPUT_DIR}/nmap_raw.gnmap"
@@ -208,25 +218,35 @@ parse_open_ports() {
         exit 1
     fi
 
-    # Write CSV header
+    # Write pipe-delimited header
     echo "host|port|protocol|state|service|version" > "$out_file"
 
     local port_count=0
 
-    # Process every "Host:" line that contains open ports
+    # The grep below is where the file is physically opened and read.
+    # It feeds matching lines into the while loop via process substitution.
     while IFS= read -r line; do
 
-        # Extract host IP
+        # Extract host IP from "Host: 1.2.3.4 ()" — skip line if not found
+        # -z = zero-length = empty → skip lines where grep found nothing
         local host
         host="$(echo "$line" | grep -oP 'Host:\s+\K[\d\.]+(?=\s)')"
         [[ -z "$host" ]] && continue
 
-        # Extract the Ports: section
+        # Capture everything after "Ports: " to end of line
         local ports_section
         ports_section="$(echo "$line" | grep -oP 'Ports:\s+\K.+')"
         [[ -z "$ports_section" ]] && continue
 
-        # Split on comma — each token is one port entry
+        # ── Defensive FIX ──────────────────────────────────────────────────────────
+        # Real nmap gnmap output appends "  Ignored State: filtered (N)" after
+        # the last port token on the same line, e.g.:
+        #   ...Samba smbd 4/        Ignored State: filtered (65529)
+        # Splitting naively on ',' would turn that suffix into a garbage token.
+        # Strip it before splitting.
+        ports_section="$(echo "$ports_section" | sed 's/[[:space:]]*Ignored State:.*$//')"
+
+        # Split on comma — each token is now a clean port entry
         IFS=',' read -ra port_tokens <<< "$ports_section"
 
         for token in "${port_tokens[@]}"; do
@@ -264,9 +284,23 @@ parse_open_ports() {
 # ─────────────────────────────────────────────────────────────────────────────
 # IDENTIFY WEB SERVICES (HTTP/HTTPS) — feed list for nikto / nuclei
 # ─────────────────────────────────────────────────────────────────────────────
-# Heuristic: flag port as web if:
-#   • Service name contains "http"
-#   • Port is 80, 443, 8080, 8443, 8000, 8888, 3000, 5000, 9090, 9443
+# A port is flagged as a web service if EITHER condition holds:
+#
+#   1. Service name matches an HTTP-family pattern.
+#      nmap doesn't always say "http" — real-world examples from your scan:
+#        webdav         → HTTP-based file-sharing protocol
+#        ssl|webdav     → WebDAV over TLS (= HTTPS)
+#        ssl|http       → plain HTTPS
+#        http-proxy     → proxy serving HTTP
+#      Regex therefore matches: http, webdav, ssl (any ssl on these ports
+#      is serving an application layer we want to scan).
+#
+#   2. Port number is in the well-known web-port list regardless of service
+#      name (catches mis-labelled or undetected service names).
+#
+# Scheme assignment:
+#   https if service contains "ssl" OR port is a standard TLS port (443/8443/9443)
+#   http  otherwise
 # ─────────────────────────────────────────────────────────────────────────────
 identify_web_services() {
     local ports_file="${OUTPUT_DIR}/open_ports.txt"
@@ -285,26 +319,30 @@ identify_web_services() {
 
     local web_count=0
 
-    # Skip header line (line 1)
+    # Read open_ports.txt line by line (file is opened here via input redirect)
     while IFS='|' read -r host port proto state service version; do
-        [[ "$host" == "host" ]] && continue  # skip CSV header
+        [[ "$host" == "host" ]] && continue  # skip the header row
 
         local is_web=0
 
-        # Check by service name
-        if echo "$service" | grep -qiE 'http|https|ssl/http'; then
+        # Condition 1 — service name is an HTTP-family protocol.
+        # 'http'    : plain HTTP or any http-* variant (http-proxy, http-alt …)
+        # 'webdav'  : WebDAV is HTTP + extensions (nmap labels it separately)
+        # 'ssl'     : any ssl-wrapped service on a web port → treat as HTTPS
+        if echo "$service" | grep -qiE 'http|webdav|ssl'; then
             is_web=1
         fi
 
-        # Check by well-known port number
+        # Condition 2 — port is in the well-known web-port list
         if [[ "$port" =~ $port_regex ]]; then
             is_web=1
         fi
 
         if (( is_web )); then
-            # Determine scheme
+            # Assign scheme: https if service contains "ssl" or port is a TLS port
             local scheme="http"
-            if echo "$service" | grep -qiE 'https|ssl' || [[ "$port" == "443" || "$port" == "8443" || "$port" == "9443" ]]; then
+            if echo "$service" | grep -qiE 'ssl' || \
+               [[ "$port" == "443" || "$port" == "8443" || "$port" == "9443" ]]; then
                 scheme="https"
             fi
 
