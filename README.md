@@ -1,4 +1,4 @@
-# SECPIPE.sh
+# SECPIPE
 
 A Bash-based security scanning pipeline that chains four tools together into one interactive script: nmap, nikto, nuclei, and ffuf.
 
