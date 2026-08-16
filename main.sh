@@ -23,8 +23,8 @@ readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 # Colour codes (disabled automatically if not a TTY)
 if [[ -t 1 ]]; then
-    RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
-    CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+    RED=$'\033[0;31m'; YELLOW=$'\033[1;33m'; GREEN=$'\033[0;32m'
+    CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
 else
     RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD=''; RESET=''
 fi
@@ -673,6 +673,7 @@ configure_nuclei_scan() {
 # ─────────────────────────────────────────────────────────────────────────────
 FFUF_FLAGS=()
 FFUF_WORDLIST=""
+FFUF_WORDLIST_IS_TEMP=0
 FFUF_CMD_PREVIEW=""
 
 # Candidate wordlist paths, checked in priority order (most curated/signal-
@@ -766,6 +767,7 @@ configure_ffuf_scan() {
     log_section "ffuf Scan Configuration"
 
     FFUF_FLAGS=()
+    FFUF_WORDLIST_IS_TEMP=0
 
     # ── 1. Wordlist selection ─────────────────────────────────────────────────
     local wordlist_choice
@@ -787,6 +789,7 @@ configure_ffuf_scan() {
             log_warn "No standard wordlist found on disk (checked dirb/SecLists paths)."
             log_warn "Falling back to a small built-in curated list (~70 high-signal paths)."
             FFUF_WORDLIST="$(mktemp /tmp/ffuf_fallback_wordlist.XXXXXX.txt)"
+            FFUF_WORDLIST_IS_TEMP=1
             _ffuf_write_fallback_wordlist "$FFUF_WORDLIST"
             log_info "For broader coverage, install SecLists:  sudo apt install seclists"
         else
@@ -1183,6 +1186,42 @@ identify_web_services() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LIVE NIKTO FINDING MONITOR
+# ─────────────────────────────────────────────────────────────────────────────
+# Nikto prints each finding to the console the moment it's discovered as a
+# line starting with "+ " — same lines parse_nikto_findings() later extracts
+# from the saved report. Mirroring that live, filtered down to just the
+# finding text, gives the same "watch it happen, bail out if you've seen
+# enough" experience the ffuf live monitor provides.
+# ─────────────────────────────────────────────────────────────────────────────
+_NIKTO_NOTABLE_KEYWORDS='admin|login|backup|\.sql|\.git|\.env|config|phpinfo|shell|inject|disclos|wp-|exec|password|secret'
+
+_nikto_live_monitor() {
+    local match_count=0
+    local notable_count=0
+    local line
+
+    while IFS= read -r line; do
+        [[ "$line" == +\ * ]] || continue
+        [[ "$line" == *"Target IP:"* || "$line" == *"Target Hostname:"* || \
+           "$line" == *"Target Port:"* || "$line" == *"Start Time:"* || \
+           "$line" == *"End Time:"* || "$line" == *"requests:"*"item(s) reported"* ]] && continue
+
+        (( match_count++ )) || true
+        local finding="${line#+ }"
+
+        if echo "$finding" | grep -qiE "$_NIKTO_NOTABLE_KEYWORDS"; then
+            (( notable_count++ )) || true
+            echo -e "    ${RED}${BOLD}⚠  NOTABLE${RESET}  [${match_count}] ${finding}" >&2
+        else
+            echo -e "    ${GREEN}[${match_count}]${RESET} ${finding}" >&2
+        fi
+    done
+
+    echo -e "  ${CYAN}── ${match_count} finding(s) so far, ${notable_count} notable ──${RESET}" >&2
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RUN NIKTO SCAN  (Step 2)
 # ─────────────────────────────────────────────────────────────────────────────
 # Iterates web_services.txt (produced by identify_web_services) and runs one
@@ -1191,6 +1230,12 @@ identify_web_services() {
 #
 # Per-endpoint outputs go to: ${OUTPUT_DIR}/nikto/<host>_<port>.<format>
 # A live log of each run is tee'd to:    ${OUTPUT_DIR}/nikto/<host>_<port>.log
+#
+# CTRL+C SAFETY: same pattern as run_ffuf_scan — a scoped INT trap catches
+# the signal instead of letting it kill the whole script, logs what
+# happened, stops scanning any remaining endpoints, and falls through to
+# parse_nikto_findings() as usual (which recovers whatever was captured —
+# see its header comment).
 # ─────────────────────────────────────────────────────────────────────────────
 run_nikto_scan() {
     local web_file="${OUTPUT_DIR}/web_services.txt"
@@ -1212,6 +1257,11 @@ run_nikto_scan() {
 
     local endpoint_count=0
     local scan_failures=0
+    local NIKTO_INTERRUPTED=0
+
+    log_info "Live findings will print below as they're found. Press ${BOLD}Ctrl+C${RESET} anytime to stop early — partial results are preserved."
+
+    trap 'NIKTO_INTERRUPTED=1' INT
 
     # grep -v '^#' strips the two header/comment lines written by
     # identify_web_services, leaving one scheme://host:port endpoint per line.
@@ -1246,16 +1296,28 @@ run_nikto_scan() {
 
         # || true: a single failed/target-unreachable nikto run must not abort
         # the whole pipeline stage — we log it and move to the next endpoint.
-        if ! nikto -h "$host" -p "$port" "${target_flags[@]}" \
+        if ! { nikto -h "$host" -p "$port" "${target_flags[@]}" \
                 -Format "$NIKTO_FORMAT" -o "$out_file" \
-                2>&1 | tee "$log_file"; then
-            log_warn "  nikto run against ${endpoint} reported a non-zero exit — see $log_file"
-            (( scan_failures++ )) || true
+                2>&1 | tee "$log_file" | _nikto_live_monitor; }; then
+            if (( NIKTO_INTERRUPTED )); then
+                log_warn "  nikto interrupted by user (Ctrl+C) — partial results for ${endpoint} preserved in $out_file / $log_file."
+            else
+                log_warn "  nikto run against ${endpoint} reported a non-zero exit — see $log_file"
+                (( scan_failures++ )) || true
+            fi
+        fi
+
+        if (( NIKTO_INTERRUPTED )); then
+            touch "${nikto_dir}/.interrupted"
+            log_warn "Stopping nikto stage early — skipping any remaining endpoints."
+            break
         fi
 
     done < <(grep -v '^#' "$web_file")
 
-    log_info "nikto stage complete: ${BOLD}${endpoint_count}${RESET} endpoint(s) scanned, ${scan_failures} failure(s)."
+    trap - INT
+
+    log_info "nikto stage complete: ${BOLD}${endpoint_count}${RESET} endpoint(s) attempted, ${scan_failures} failure(s)."
     log_info "Raw reports → $nikto_dir/"
 }
 
@@ -1323,7 +1385,44 @@ parse_nikto_findings() {
         done < "$report_file"
     done
 
+    if [[ -f "${OUTPUT_DIR}/nikto/.interrupted" ]]; then
+        log_warn "Note: nikto stage was interrupted early (Ctrl+C) — findings above reflect partial endpoint coverage."
+    fi
+
     log_info "Parsed ${BOLD}${finding_count}${RESET} finding(s) → $out_file"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN NUCLEI SCAN  (Step 3)
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# LIVE NUCLEI MATCH MONITOR
+# ─────────────────────────────────────────────────────────────────────────────
+# nuclei's default (non -silent) console output prints each match as a line
+# in the form "[template-id] [protocol] [severity] matched-url". This reads
+# that stream and prints a compact counter, highlighting high/critical hits.
+# ─────────────────────────────────────────────────────────────────────────────
+_nuclei_live_monitor() {
+    local match_count=0
+    local notable_count=0
+    local line
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^\[.+\]\ \[.+\]\ \[.+\] ]] || continue
+
+        (( match_count++ )) || true
+        local severity
+        severity="$(echo "$line" | grep -oP '(?<=\[)[a-z]+(?=\])' | sed -n '3p')"
+
+        if [[ "$severity" == "critical" || "$severity" == "high" ]]; then
+            (( notable_count++ )) || true
+            echo -e "    ${RED}${BOLD}⚠  ${severity^^}${RESET}  [${match_count}] ${line}" >&2
+        else
+            echo -e "    ${GREEN}[${match_count}]${RESET} ${line}" >&2
+        fi
+    done
+
+    echo -e "  ${CYAN}── ${match_count} match(es) so far, ${notable_count} high/critical ──${RESET}" >&2
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1338,6 +1437,15 @@ parse_nikto_findings() {
 # Output: ${OUTPUT_DIR}/nuclei/targets.txt   — the -l input file we build
 #         ${OUTPUT_DIR}/nuclei/nuclei_raw.jsonl — one JSON finding per line
 #         ${OUTPUT_DIR}/nuclei/nuclei_raw.log    — live run log (tee'd)
+#
+# CTRL+C SAFETY: unlike ffuf/nikto there's no per-endpoint loop to break out
+# of — nuclei handles the whole target list in one process — so a scoped
+# INT trap here just needs to catch the signal, stop the script dying via
+# set -e, and log what happened. -jsonl writes one complete JSON object per
+# line as each match is found, so any results already written to the file
+# before the interrupt are already complete, valid, and safely parseable —
+# only a match caught mid-write (rare — writes are per-line) is at risk, and
+# parse_nuclei_findings() below is hardened against exactly that.
 # ─────────────────────────────────────────────────────────────────────────────
 run_nuclei_scan() {
     local web_file="${OUTPUT_DIR}/web_services.txt"
@@ -1360,6 +1468,7 @@ run_nuclei_scan() {
     local targets_file="${nuclei_dir}/targets.txt"
     local out_file="${nuclei_dir}/nuclei_raw.jsonl"
     local log_file="${nuclei_dir}/nuclei_raw.log"
+    local NUCLEI_INTERRUPTED=0
 
     # Build the -l target list directly from web_services.txt, stripping the
     # "# ..." comment/header lines identify_web_services() writes at the top.
@@ -1369,15 +1478,24 @@ run_nuclei_scan() {
     target_count="$(wc -l < "$targets_file" | tr -d ' ')"
     log_info "Target list (${BOLD}${target_count}${RESET} endpoint(s)) → $targets_file"
     log_info "Command: nuclei -l $targets_file ${NUCLEI_FLAGS[*]} -o $out_file"
-    log_warn "Scan is running — duration depends on template set and rate limit."
+    log_info "Live matches will print below as they're found. Press ${BOLD}Ctrl+C${RESET} anytime to stop early — partial results are preserved."
+
+    trap 'NUCLEI_INTERRUPTED=1' INT
 
     # || true: nuclei exits non-zero on some non-fatal conditions (e.g. partial
     # template failures); we don't want that to abort the whole pipeline the
     # way a genuine setup error would. Failure is logged, not silently eaten.
-    if ! nuclei -l "$targets_file" "${NUCLEI_FLAGS[@]}" -o "$out_file" \
-            2>&1 | tee "$log_file"; then
-        log_warn "nuclei exited with a non-zero status — check $log_file"
+    if ! { nuclei -l "$targets_file" "${NUCLEI_FLAGS[@]}" -o "$out_file" \
+            2>&1 | tee "$log_file" | _nuclei_live_monitor; }; then
+        if (( NUCLEI_INTERRUPTED )); then
+            touch "${nuclei_dir}/.interrupted"
+            log_warn "nuclei interrupted by user (Ctrl+C) — partial results preserved in $out_file / $log_file."
+        else
+            log_warn "nuclei exited with a non-zero status — check $log_file"
+        fi
     fi
+
+    trap - INT
 
     if [[ -s "$out_file" ]]; then
         local finding_lines
@@ -1397,10 +1515,13 @@ run_nuclei_scan() {
 #   {"template-id":"tech-detect","info":{"name":"Nginx","severity":"info"},
 #    "host":"https://192.168.1.10:8443","matched-at":"https://192.168.1.10:8443", ...}
 #
-# We prefer jq when available (proper JSON parsing — handles escaped commas,
-# nested quotes, unicode, etc. correctly). If jq is not installed, we fall
-# back to a best-effort grep/sed extraction that works for nuclei's typical
-# flat-field output but is not a general JSON parser.
+# Parsed LINE-BY-LINE rather than as a whole-file jq stream — this is what
+# makes it Ctrl+C-safe: if the scan was interrupted mid-write, only the
+# single incomplete trailing line fails its "does this look like a complete
+# JSON object" check and gets skipped; every earlier line, each one a
+# complete finding already flushed to disk, parses normally. Prefers jq per
+# line when available (proper JSON parsing); falls back to best-effort
+# grep extraction otherwise.
 # ─────────────────────────────────────────────────────────────────────────────
 parse_nuclei_findings() {
     local raw_file="${OUTPUT_DIR}/nuclei/nuclei_raw.jsonl"
@@ -1421,33 +1542,49 @@ parse_nuclei_findings() {
     echo "severity|template-id|host|matched-at|name" > "$out_file"
 
     local finding_count=0
+    local skipped_incomplete=0
+    local jq_available=0
+    command -v jq &>/dev/null && jq_available=1
+    (( jq_available )) || log_warn "jq not found — using best-effort text extraction per line."
 
-    if command -v jq &>/dev/null; then
-        log_info "Using jq for JSONL parsing (preferred — handles edge cases correctly)."
-        while IFS=$'\t' read -r severity template_id host matched_at name; do
-            [[ -z "$template_id" ]] && continue
-            # Replace any literal '|' in free-text fields so the pipe format stays intact
-            name="${name//|/;}"
-            echo "${severity}|${template_id}|${host}|${matched_at}|${name}" >> "$out_file"
-            (( finding_count++ )) || true
-        done < <(jq -r '[.info.severity, ."template-id", .host, ."matched-at", .info.name] | @tsv' "$raw_file" 2>/dev/null || true)
-    else
-        log_warn "jq not found — falling back to best-effort text extraction."
-        log_warn "Install jq for reliable parsing:  sudo apt install jq  |  brew install jq"
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            local severity template_id host matched_at name
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        # A complete JSON object line starts with { and ends with } — a line
+        # cut short mid-write by Ctrl+C won't, and is skipped here rather
+        # than fed to a parser that would error on it.
+        if [[ "$line" != \{*\} ]]; then
+            (( skipped_incomplete++ )) || true
+            continue
+        fi
+
+        local severity template_id host matched_at name
+        if (( jq_available )); then
+            IFS=$'\t' read -r severity template_id host matched_at name < <(
+                echo "$line" | jq -r '[.info.severity, ."template-id", .host, ."matched-at", .info.name] | @tsv' 2>/dev/null
+            ) || true
+        fi
+
+        # jq unavailable, or it choked on this specific line for some other
+        # reason (still worth a text-based attempt rather than losing the row)
+        if [[ -z "$template_id" ]]; then
             severity="$(echo "$line" | grep -oP '"severity"\s*:\s*"\K[^"]+' | head -1)"
             template_id="$(echo "$line" | grep -oP '"template-id"\s*:\s*"\K[^"]+' | head -1)"
             host="$(echo "$line" | grep -oP '"host"\s*:\s*"\K[^"]+' | head -1)"
             matched_at="$(echo "$line" | grep -oP '"matched-at"\s*:\s*"\K[^"]+' | head -1)"
             name="$(echo "$line" | grep -oP '"name"\s*:\s*"\K[^"]+' | head -1)"
-            [[ -z "$template_id" ]] && continue
-            name="${name//|/;}"
-            echo "${severity:-unknown}|${template_id}|${host}|${matched_at}|${name}" >> "$out_file"
-            (( finding_count++ )) || true
-        done < "$raw_file"
+        fi
+
+        [[ -z "$template_id" ]] && continue
+        name="${name//|/;}"
+        echo "${severity:-unknown}|${template_id}|${host}|${matched_at}|${name}" >> "$out_file"
+        (( finding_count++ )) || true
+    done < "$raw_file"
+
+    if [[ -f "${OUTPUT_DIR}/nuclei/.interrupted" ]]; then
+        log_warn "Note: nuclei stage was interrupted early (Ctrl+C) — findings above reflect partial template coverage."
     fi
+    (( skipped_incomplete > 0 )) && log_info "Skipped ${skipped_incomplete} incomplete trailing line(s) (expected if the scan was interrupted mid-write)."
 
     log_info "Parsed ${BOLD}${finding_count}${RESET} finding(s) → $out_file"
 }
@@ -1463,6 +1600,46 @@ parse_nuclei_findings() {
 _FFUF_HIGH_SIGNAL_PATTERNS='\.env(\.|$)|\.git(/|$)|\.svn(/|$)|\.htpasswd|\.htaccess|wp-config|wp-admin|wp-login|phpinfo|server-status|server-info|robots\.txt|sitemap\.xml|\.well-known/security\.txt|admin|login|backup|\.sql$|\.zip$|\.tar\.gz$|\.bak$|\.old$|docker-compose|Dockerfile|\.DS_Store|id_rsa|swagger|api-docs|graphql|actuator|debug|console|\.idea|\.vscode|web\.config|configuration\.php|dump\.sql|database\.sql|crossdomain\.xml'
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LIVE FFUF MATCH MONITOR
+# ─────────────────────────────────────────────────────────────────────────────
+# Reads ffuf's own stdout as it streams (one process stage in a pipe) and
+# prints a compact, one-line-per-match indicator instead of ffuf's default
+# boxed report — so a user watching a long scan can see what's being found
+# in real time and make an informed call to Ctrl+C early, without having to
+# parse ffuf's noisier native output.
+#
+# ffuf's default (non-silent) text output prints each match as a line
+# containing "[Status: <code>, Size: <n>, Words: <n>, ...]" — every other
+# line (progress bar redraws, banner, summary) is passed through untouched
+# to the log file by `tee` upstream of this function but is simply not
+# matched/counted here.
+# ─────────────────────────────────────────────────────────────────────────────
+_ffuf_live_monitor() {
+    local match_count=0
+    local notable_count=0
+    local line
+
+    while IFS= read -r line; do
+        [[ "$line" == *"[Status:"* ]] || continue
+
+        (( match_count++ )) || true
+
+        local path status
+        path="$(echo "$line" | awk '{print $1}')"
+        status="$(echo "$line" | grep -oP '(?<=Status: )[0-9]+' || true)"
+
+        if echo "$path" | grep -qiE "$_FFUF_HIGH_SIGNAL_PATTERNS"; then
+            (( notable_count++ )) || true
+            echo -e "    ${RED}${BOLD}⚠  NOTABLE${RESET}  [${match_count}] ${BOLD}${path}${RESET}  (status ${status:-?})" >&2
+        else
+            echo -e "    ${GREEN}[${match_count}]${RESET} ${path}  (status ${status:-?})" >&2
+        fi
+    done
+
+    echo -e "  ${CYAN}── ${match_count} match(es) so far, ${notable_count} notable ──${RESET}" >&2
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RUN FFUF SCAN  (Step 4)
 # ─────────────────────────────────────────────────────────────────────────────
 # Runs once PER endpoint (ffuf's -u target/FUZZ model is inherently
@@ -1470,6 +1647,16 @@ _FFUF_HIGH_SIGNAL_PATTERNS='\.env(\.|$)|\.git(/|$)|\.svn(/|$)|\.htpasswd|\.htacc
 #
 # Output per endpoint: ffuf/<host>_<port>.json  (ffuf's native -of json report)
 #                       ffuf/<host>_<port>.log   (live run log, tee'd)
+#
+# CTRL+C SAFETY: a dedicated INT trap is installed for the duration of this
+# function only. On SIGINT it does NOT let the script die mid-write — it
+# sets a flag, lets the current ffuf process (which also receives the
+# signal and exits on its own) unwind normally, logs what happened, skips
+# any remaining endpoints, and falls through to parse_ffuf_results() as
+# usual. parse_ffuf_results() is itself hardened (see its header comment)
+# to recover whatever was captured even if ffuf's JSON file was left
+# incomplete by the interruption — no results are lost, only the endpoints
+# that hadn't started yet are skipped.
 # ─────────────────────────────────────────────────────────────────────────────
 run_ffuf_scan() {
     local web_file="${OUTPUT_DIR}/web_services.txt"
@@ -1491,6 +1678,11 @@ run_ffuf_scan() {
 
     local endpoint_count=0
     local scan_failures=0
+    local FFUF_INTERRUPTED=0
+
+    log_info "Live matches will print below as they're found. Press ${BOLD}Ctrl+C${RESET} anytime to stop early — partial results are preserved."
+
+    trap 'FFUF_INTERRUPTED=1' INT
 
     while IFS= read -r endpoint; do
         [[ -z "$endpoint" ]] && continue
@@ -1513,17 +1705,31 @@ run_ffuf_scan() {
         log_info "  🔎  Fuzzing ${BOLD}${target_url}${RESET} → $out_file"
 
         # || true: one endpoint erroring out (dead host, TLS handshake
-        # failure, etc.) must not abort the whole ffuf stage.
-        if ! ffuf -u "$target_url" -w "${FFUF_WORDLIST}:FUZZ" "${FFUF_FLAGS[@]}" \
+        # failure, etc.) must not abort the whole ffuf stage. tee writes the
+        # complete raw stream to $log_file (used as a parsing fallback);
+        # _ffuf_live_monitor consumes the same stream to print live matches.
+        if ! { ffuf -u "$target_url" -w "${FFUF_WORDLIST}:FUZZ" "${FFUF_FLAGS[@]}" \
                 -o "$out_file" \
-                2>&1 | tee "$log_file"; then
-            log_warn "  ffuf run against ${endpoint} reported a non-zero exit — see $log_file"
-            (( scan_failures++ )) || true
+                2>&1 | tee "$log_file" | _ffuf_live_monitor; }; then
+            if (( FFUF_INTERRUPTED )); then
+                log_warn "  ffuf interrupted by user (Ctrl+C) — partial results for ${endpoint} preserved in $out_file / $log_file."
+            else
+                log_warn "  ffuf run against ${endpoint} reported a non-zero exit — see $log_file"
+                (( scan_failures++ )) || true
+            fi
+        fi
+
+        if (( FFUF_INTERRUPTED )); then
+            touch "${ffuf_dir}/.interrupted"
+            log_warn "Stopping ffuf stage early — skipping any remaining endpoints."
+            break
         fi
 
     done < <(grep -v '^#' "$web_file")
 
-    log_info "ffuf stage complete: ${BOLD}${endpoint_count}${RESET} endpoint(s) fuzzed, ${scan_failures} failure(s)."
+    trap - INT
+
+    log_info "ffuf stage complete: ${BOLD}${endpoint_count}${RESET} endpoint(s) attempted, ${scan_failures} failure(s)."
     log_info "Raw reports → $ffuf_dir/"
 }
 
@@ -1534,11 +1740,19 @@ run_ffuf_scan() {
 # Each result object has (in this fixed key order): input, position, status,
 # length, words, lines, content-type, redirectlocation, url, host, resultfile.
 #
-# Prefers jq (order-independent, handles edge cases in URLs/paths correctly).
-# Falls back to a positional grep+paste extraction: since ffuf always emits
-# these keys in the same order per result, pulling each field's values in
-# file order with grep -oP and zipping them column-wise with `paste` gives
-# the same rows jq would, without needing a real JSON parser.
+# Prefers jq (order-independent, handles edge cases in URLs/paths correctly)
+# — but ONLY when the file is verified valid JSON first. A scan interrupted
+# mid-write (Ctrl+C) can leave a truncated file; jq would error on that and
+# silently return zero rows even though dozens of matches were captured.
+# That failure mode is exactly what we need to avoid per the "don't damage
+# findings on Ctrl+C" requirement, so invalid JSON routes to two fallback
+# layers instead:
+#   1. Positional grep+paste over the same file, truncated to the shortest
+#      field list so a partially-written trailing object is dropped cleanly
+#      rather than producing a misaligned row.
+#   2. If that still yields nothing (interrupted before any field completed),
+#      recover matches from ffuf's plain-text .log file instead — each match
+#      there is a single self-contained line, immune to JSON structure.
 # ─────────────────────────────────────────────────────────────────────────────
 parse_ffuf_results() {
     local ffuf_dir="${OUTPUT_DIR}/ffuf"
@@ -1560,42 +1774,101 @@ parse_ffuf_results() {
 
     local finding_count=0
     local report_file
-    local use_jq=0
-    command -v jq &>/dev/null && use_jq=1
-    (( use_jq )) && log_info "Using jq for JSON parsing (preferred)." \
-                 || log_warn "jq not found — using positional grep+paste fallback."
+    local jq_available=0
+    command -v jq &>/dev/null && jq_available=1
 
     for report_file in "$ffuf_dir"/*.json; do
         [[ -f "$report_file" ]] || continue
 
-        local base host port
+        local base host port log_file
         base="$(basename "$report_file" .json)"
         host="${base%_*}"
         port="${base##*_}"
+        log_file="${ffuf_dir}/${base}.log"
 
-        if (( use_jq )); then
+        local file_finding_count=0
+
+        # Only trust jq's parse if the file is verified valid JSON first —
+        # an interrupted (Ctrl+C) run can leave a truncated file that jq
+        # would error on and silently return nothing for.
+        local json_valid=0
+        if (( jq_available )) && jq empty "$report_file" &>/dev/null; then
+            json_valid=1
+        fi
+
+        if (( json_valid )); then
             while IFS=$'\t' read -r status length words url; do
                 [[ -z "$url" ]] && continue
                 local path="${url#*://*/}"
                 echo "${host}|${port}|${path}|${status}|${length}|${words}|${url}" >> "$out_file"
                 (( finding_count++ )) || true
+                (( file_finding_count++ )) || true
             done < <(jq -r '.results[]? | [.status, .length, .words, .url] | @tsv' "$report_file" 2>/dev/null || true)
         else
-            # Positional fallback — see function header for the ordering assumption.
-            local status_list length_list words_list url_list
-            status_list="$(grep -oP '"status":\s*\K[0-9]+' "$report_file")"
-            length_list="$(grep -oP '"length":\s*\K[0-9]+' "$report_file")"
-            words_list="$(grep -oP '"words":\s*\K[0-9]+' "$report_file")"
-            url_list="$(grep -oP '"url":\s*"\K[^"]+' "$report_file")"
+            if (( jq_available )) && [[ -s "$report_file" ]]; then
+                log_warn "  ${base}.json failed JSON validation (scan was likely interrupted) — using resilient fallback parser."
+            elif (( ! jq_available )); then
+                log_warn "  jq not found — using positional grep+paste fallback for ${base}."
+            fi
 
-            while IFS='|' read -r status length words url; do
-                [[ -z "$url" ]] && continue
-                local path="${url#*://*/}"
-                echo "${host}|${port}|${path}|${status}|${length}|${words}|${url}" >> "$out_file"
-                (( finding_count++ )) || true
-            done < <(paste -d'|' <(echo "$status_list") <(echo "$length_list") <(echo "$words_list") <(echo "$url_list"))
+            # FALLBACK LAYER 1 — positional grep+paste, truncated to the
+            # shortest field list so a partially-written trailing object
+            # (missing its last key or two) is dropped cleanly instead of
+            # producing a misaligned row.
+            local status_list length_list words_list url_list
+            status_list="$(grep -oP '"status":\s*\K[0-9]+' "$report_file" 2>/dev/null || true)"
+            length_list="$(grep -oP '"length":\s*\K[0-9]+' "$report_file" 2>/dev/null || true)"
+            words_list="$(grep -oP '"words":\s*\K[0-9]+' "$report_file" 2>/dev/null || true)"
+            url_list="$(grep -oP '"url":\s*"\K[^"]+' "$report_file" 2>/dev/null || true)"
+
+            local n_status n_length n_words n_url min_n
+            n_status="$([[ -n "$status_list" ]] && wc -l <<< "$status_list" || echo 0)"
+            n_length="$([[ -n "$length_list" ]] && wc -l <<< "$length_list" || echo 0)"
+            n_words="$([[ -n "$words_list" ]] && wc -l <<< "$words_list" || echo 0)"
+            n_url="$([[ -n "$url_list" ]] && wc -l <<< "$url_list" || echo 0)"
+            min_n=$(( n_status < n_length ? n_status : n_length ))
+            min_n=$(( min_n < n_words ? min_n : n_words ))
+            min_n=$(( min_n < n_url ? min_n : n_url ))
+
+            if (( min_n > 0 )); then
+                while IFS='|' read -r status length words url; do
+                    [[ -z "$url" ]] && continue
+                    local path="${url#*://*/}"
+                    echo "${host}|${port}|${path}|${status}|${length}|${words}|${url}" >> "$out_file"
+                    (( finding_count++ )) || true
+                    (( file_finding_count++ )) || true
+                done < <(paste -d'|' <(head -n "$min_n" <<< "$status_list") \
+                                      <(head -n "$min_n" <<< "$length_list") \
+                                      <(head -n "$min_n" <<< "$words_list") \
+                                      <(head -n "$min_n" <<< "$url_list"))
+            fi
+
+            # FALLBACK LAYER 2 — last resort. If the JSON gave us nothing
+            # usable at all (interrupted before even one field completed),
+            # recover matches straight from ffuf's plain-text .log file —
+            # each match there is one self-contained line, independent of
+            # JSON structure entirely: "path   [Status: 200, Size: 45, ...]"
+            if (( file_finding_count == 0 )) && [[ -f "$log_file" ]]; then
+                log_warn "  No usable data in ${base}.json — recovering matches from ${base}.log instead."
+                while IFS= read -r line; do
+                    [[ "$line" == *"[Status:"* ]] || continue
+                    local lpath lstatus llength lwords
+                    lpath="$(echo "$line" | awk '{print $1}')"
+                    lstatus="$(echo "$line" | grep -oP '(?<=Status: )[0-9]+' || true)"
+                    llength="$(echo "$line" | grep -oP '(?<=Size: )[0-9]+' || true)"
+                    lwords="$(echo "$line" | grep -oP '(?<=Words: )[0-9]+' || true)"
+                    [[ -z "$lpath" || -z "$lstatus" ]] && continue
+                    echo "${host}|${port}|${lpath}|${lstatus}|${llength:-0}|${lwords:-0}|${host}:${port}/${lpath}" >> "$out_file"
+                    (( finding_count++ )) || true
+                    (( file_finding_count++ )) || true
+                done < "$log_file"
+            fi
         fi
     done
+
+    if [[ -f "${ffuf_dir}/.interrupted" ]]; then
+        log_warn "Note: ffuf stage was interrupted early (Ctrl+C) — results above reflect partial wordlist coverage, not a completed scan."
+    fi
 
     log_info "Parsed ${BOLD}${finding_count}${RESET} result(s) → $out_file"
 }
@@ -1664,6 +1937,59 @@ identify_notable_ffuf_findings() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GENERATE UNIFIED CROSS-TOOL REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+# The per-tool findings files (nikto_findings.txt, nuclei_findings.txt,
+# ffuf_notable.txt) are each keyed differently and read separately. This
+# pulls all three into one host-keyed file, ${OUTPUT_DIR}/unified_findings.txt
+# (host|port|tool|severity_or_status|detail), so "everything found on this
+# one host, from every tool" is a single grep away instead of three.
+# Silently produces an empty-but-headered file if no tools ran / found
+# anything — downstream consumers (generate_summary) handle that cleanly.
+# ─────────────────────────────────────────────────────────────────────────────
+generate_unified_report() {
+    local out_file="${OUTPUT_DIR}/unified_findings.txt"
+
+    log_section "Generating Unified Cross-Tool Report"
+
+    echo "host|port|tool|severity_or_status|detail" > "$out_file"
+    local total=0
+
+    if [[ -s "${OUTPUT_DIR}/nikto_findings.txt" ]]; then
+        while IFS='|' read -r host port finding; do
+            [[ "$host" == "host" ]] && continue
+            echo "${host}|${port}|nikto|-|${finding}" >> "$out_file"
+            (( total++ )) || true
+        done < "${OUTPUT_DIR}/nikto_findings.txt"
+    fi
+
+    if [[ -s "${OUTPUT_DIR}/nuclei_findings.txt" ]]; then
+        while IFS='|' read -r severity template_id host matched_at name; do
+            [[ "$severity" == "severity" ]] && continue
+            local port hostonly
+            # nuclei's "host" field is a full scheme://host:port URL — pull
+            # the bare host and port back out so this rolls up under the
+            # same host key nikto/ffuf use.
+            hostonly="$(echo "$host" | grep -oP '(?<=://)[^:/]+' || echo "$host")"
+            port="$(echo "$host" | grep -oP ':\K[0-9]+' | head -1)"
+            [[ -z "$port" ]] && port="?"
+            echo "${hostonly}|${port}|nuclei|${severity}|${template_id}: ${name}" >> "$out_file"
+            (( total++ )) || true
+        done < "${OUTPUT_DIR}/nuclei_findings.txt"
+    fi
+
+    if [[ -s "${OUTPUT_DIR}/ffuf_notable.txt" ]]; then
+        while IFS='|' read -r priority host port path status length url; do
+            [[ "$priority" == "priority" ]] && continue
+            echo "${host}|${port}|ffuf|${status}|${path}" >> "$out_file"
+            (( total++ )) || true
+        done < "${OUTPUT_DIR}/ffuf_notable.txt"
+    fi
+
+    log_info "Unified report: ${BOLD}${total}${RESET} cross-tool finding(s) → $out_file"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GENERATE HUMAN-READABLE SUMMARY REPORT
 # ─────────────────────────────────────────────────────────────────────────────
 generate_summary() {
@@ -1681,6 +2007,23 @@ generate_summary() {
         echo "  Output Dir  : $OUTPUT_DIR"
         echo "════════════════════════════════════════════════════════"
         echo ""
+
+        if [[ -s "${OUTPUT_DIR}/unified_findings.txt" ]] && \
+           (( $(tail -n +2 "${OUTPUT_DIR}/unified_findings.txt" | wc -l) > 0 )); then
+            echo "── CONSOLIDATED FINDINGS BY HOST (all tools) ──────────"
+            local uhosts
+            uhosts="$(tail -n +2 "${OUTPUT_DIR}/unified_findings.txt" | cut -d'|' -f1 | sort -u)"
+            while IFS= read -r h; do
+                [[ -z "$h" ]] && continue
+                echo "  ${BOLD}${h}${RESET}"
+                grep "^${h}|" "${OUTPUT_DIR}/unified_findings.txt" | \
+                while IFS='|' read -r fhost fport ftool fsev fdetail; do
+                    printf "    [%-6s] port %-5s %-8s %s\n" "$ftool" "$fport" "$fsev" "$fdetail"
+                done
+            done <<< "$uhosts"
+            echo ""
+        fi
+
         echo "── OPEN PORTS ──────────────────────────────────────────"
         printf "%-18s %-8s %-6s %-20s %s\n" "HOST" "PORT" "PROTO" "SERVICE" "VERSION"
         printf "%-18s %-8s %-6s %-20s %s\n" "────────────────" "──────" "─────" "──────────────────" "───────────"
@@ -1738,6 +2081,9 @@ generate_summary() {
 
         if (( PIPELINE_TOOLS[ffuf] )); then
             echo ""
+            if [[ -f "${OUTPUT_DIR}/ffuf/.interrupted" ]]; then
+                echo "  ⚠ ffuf scan was interrupted early (Ctrl+C) — coverage below is partial."
+            fi
             echo "── FFUF: NOTABLE / HIGH-SIGNAL FINDINGS ───────────────"
             if [[ -s "${OUTPUT_DIR}/ffuf_notable.txt" ]]; then
                 printf "%-6s %-18s %-6s %-8s %s\n" "STATUS" "HOST" "PORT" "LENGTH" "PATH"
@@ -1796,7 +2142,7 @@ main() {
     echo "  ╚════██║██╔══╝  ██║         ██╔═══╝ ██║██╔═══╝ ██╔══╝  "
     echo "  ███████║███████╗╚██████╗    ██║     ██║██║     ███████╗ "
     echo "  ╚══════╝╚══════╝ ╚═════╝    ╚═╝     ╚═╝╚═╝     ╚══════╝"
-    echo -e "  Security Pipeline — nmap + nikto v${SCRIPT_VERSION}${RESET}"
+    echo -e "  Security Pipeline — nmap + nikto + nuclei + ffuf v${SCRIPT_VERSION}${RESET}"
     echo ""
 
     [[ "${1:-}" =~ ^(-h|--help)$ ]] && usage
@@ -1808,6 +2154,8 @@ main() {
 
     local target="$1"
     local output_base="${2:-./scan_results}"
+    local pipeline_start_time
+    pipeline_start_time="$(date +%s)"
 
     # ── Interactive configuration (runs before any scanning) ─────────────────
     select_pipeline_tools       # 1. Ask which tools to chain
@@ -1838,12 +2186,63 @@ main() {
     run_ffuf_scan               # Step 4: skips internally if not selected / no web services
     parse_ffuf_results
     identify_notable_ffuf_findings
+    generate_unified_report
     generate_summary "$target"
+
+    # ── Housekeeping ──────────────────────────────────────────────────────────
+    cleanup_temp_files
+    archive_results
+
+    local pipeline_end_time elapsed
+    pipeline_end_time="$(date +%s)"
+    elapsed=$(( pipeline_end_time - pipeline_start_time ))
 
     log_section "Pipeline Complete"
     log_info "All files are in: ${BOLD}${OUTPUT_DIR}${RESET}"
-    log_info "All four scan stages (nmap, nikto, nuclei, ffuf) have run per your selections."
-    log_info "Remaining work: tie these stages together into one orchestrated master script."
+    log_info "Total runtime: ${BOLD}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${RESET}"
+    local ran_stages="nmap"
+    (( PIPELINE_TOOLS[nikto] ))  && ran_stages+=", nikto"
+    (( PIPELINE_TOOLS[nuclei] )) && ran_stages+=", nuclei"
+    (( PIPELINE_TOOLS[ffuf] ))   && ran_stages+=", ffuf"
+    log_info "Stages run: ${BOLD}${ran_stages}${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLEANUP TEMP FILES
+# ─────────────────────────────────────────────────────────────────────────────
+# Removes the auto-generated fallback wordlist (mktemp'd under /tmp) when one
+# was created — never touches a user-supplied or auto-detected system
+# wordlist, since FFUF_WORDLIST_IS_TEMP is only ever set to 1 by the fallback
+# path in configure_ffuf_scan().
+# ─────────────────────────────────────────────────────────────────────────────
+cleanup_temp_files() {
+    if (( FFUF_WORDLIST_IS_TEMP )) && [[ -f "$FFUF_WORDLIST" ]]; then
+        rm -f "$FFUF_WORDLIST"
+        log_info "Cleaned up temporary fallback wordlist: $FFUF_WORDLIST"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARCHIVE RESULTS
+# ─────────────────────────────────────────────────────────────────────────────
+# Bundles the entire output directory into a single .tar.gz alongside it —
+# convenient for handing off a complete report (raw scans + parsed findings
+# + summary) as one file. Never overwrites/removes the unarchived directory;
+# purely additive. A failure here is a warning, not a pipeline failure — the
+# results are already safely on disk either way.
+# ─────────────────────────────────────────────────────────────────────────────
+archive_results() {
+    local archive_path="${OUTPUT_DIR}.tar.gz"
+
+    log_section "Archiving Results"
+
+    if tar -czf "$archive_path" -C "$(dirname "$OUTPUT_DIR")" "$(basename "$OUTPUT_DIR")" 2>/dev/null; then
+        local archive_size
+        archive_size="$(du -h "$archive_path" 2>/dev/null | cut -f1)"
+        log_info "Full results archived → ${BOLD}${archive_path}${RESET} (${archive_size:-unknown size})"
+    else
+        log_warn "Archiving failed — results remain fully available, unarchived, at $OUTPUT_DIR"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
