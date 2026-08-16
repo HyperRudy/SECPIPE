@@ -40,7 +40,7 @@ This keeps every tool in the pipeline consistent and easy to extend.
 - jq
 
 ## Usage
-chmod +x SECPIPE.sh
+chmod +x SECPIPE.sh &&
 ./SECPIPE.sh
 
 
