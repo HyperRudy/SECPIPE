@@ -39,9 +39,12 @@ This keeps every tool in the pipeline consistent and easy to extend.
 - ffuf
 - jq
 
+## Installation
+git clone https://github.com/HyperRudy/SECPIPE.git
+
 ## Usage
-chmod +x SECPIPE.sh &&
-./SECPIPE.sh
+chmod +x main.sh &&
+./main.sh
 
 
 Follow the on-screen menus to configure and run each stage.
